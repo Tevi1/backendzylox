@@ -1,0 +1,5 @@
+{
+  "question": "Highrise roadmap for next 6 months with sources.",
+  "filter": "company=\"highrise\" AND time_scope IN (\"current\",\"future_plan\")"
+}
+

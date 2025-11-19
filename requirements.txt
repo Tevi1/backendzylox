@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+cryptography
+sqlalchemy
+aiosqlite
+alembic
+python-multipart
+google-genai
