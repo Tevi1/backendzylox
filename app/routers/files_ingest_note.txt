@@ -1,5 +1,0 @@
-Ensure `process_uploaded_folder` writes heuristic metadata for every file:
-- Call `app.ingestion.heuristics.derive_metadata` and merge with classifier output.
-- Persist `company`, `doc_type`, `time_scope`, `sensitivity` on both the `documents` table and Gemini File Search `custom_metadata`.
-- Contract-like filenames (msa/agreement/contract) must be tagged with `doc_type="contract"` so router filters can auto-scope legal questions.
-

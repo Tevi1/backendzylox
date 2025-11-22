@@ -9,3 +9,5 @@ aiosqlite
 alembic
 python-multipart
 google-genai
+pytest
+pytest-asyncio

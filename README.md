@@ -1,16 +1,18 @@
-# Secure Gemini RAG Backend
+# Zylox Backend - Gemini RAG + Chat API
 
-Backend-only FastAPI service that provisions Gemini File Search workspaces,
-securely stores encrypted document blobs, and lets clients query them via
-Retrieval-Augmented Generation with Gemini 2.5 Pro.
+FastAPI backend service providing two distinct Gemini-powered flows:
+1. **RAG (Retrieval-Augmented Generation)**: Document-based Q&A using Gemini 2.5 Pro + File Search
+2. **Gemini 3 Pro Chat**: Direct chat with multimodal support, structured outputs, and thought signatures
 
 ## Features
 
-- **Workspace isolation**: each workspace maps to its own Gemini File Search store.
-- **AES-256-GCM encryption**: file bytes are encrypted before persisting (no plaintext on disk).
-- **Async SQLAlchemy**: metadata stored in SQLite (swap the `DATABASE_URL` for Postgres later).
-- **Gemini 2.5 Pro + File Search**: upload documents once and chat over them with metadata filters.
-- **Clean JSON APIs**: designed for Postman or a future frontend.
+- **Dual Gemini Architecture**: Separate clients for RAG (2.5 Pro) and chat (3 Pro preview)
+- **Workspace isolation**: Each workspace maps to its own Gemini File Search store
+- **AES-256-GCM encryption**: File bytes encrypted at rest (no plaintext on disk)
+- **Async SQLAlchemy**: Metadata stored in SQLite (swap `DATABASE_URL` for Postgres without code changes)
+- **Metadata filtering**: Query documents by company, doc_type, time_scope, sensitivity
+- **Thought signature persistence**: Gemini 3 conversations retain context across turns
+- **Structured outputs**: JSON schema validation with optional tools (Google Search, URL Context, Code Execution)
 
 ## 1. Setup
 
@@ -50,78 +52,124 @@ CORS currently allows `http://localhost:5173` and Postman origins for dev use.
 GET http://localhost:8000/health
 ```
 
-## 3. API Workflows
+## 3. Architecture Overview
 
-### 3.1 Create a workspace
+### 3.1 RAG Flow (Gemini 2.5 Pro)
 
-```
+**Purpose**: Document-based question answering with metadata filtering.
+
+**Flow**:
+1. Upload files → `app/services/ingestion_agent.py` encrypts, extracts metadata, uploads to File Search
+2. Ask question → `app/services/retrieval.py` plans filters, calls `app/gemini_client.py` with File Search tool
+3. Response → Grounded answer with citations from uploaded documents
+
+**Endpoints**:
+- `POST /workspaces` - Create workspace
+- `POST /workspaces/{id}/files` - Upload documents
+- `POST /workspaces/{id}/ask` - Query documents with RAG
+- `GET /workspaces/{id}/diagnostics` - View metadata counts
+
+### 3.2 Gemini 3 Pro Chat Flow
+
+**Purpose**: Direct chat with multimodal support, structured outputs, conversation persistence.
+
+**Flow**:
+1. Send messages → `app/routers/gemini3.py` handles conversation state
+2. Generate → `app/services/gemini3_client.py` calls Gemini 3 Pro API
+3. Persist → Thought signatures and message history stored in `conversation_histories` table
+
+**Endpoints**:
+- `POST /api/v1/chat/gemini3` - Text + multimodal chat
+- `POST /api/v1/chat/gemini3/structured` - JSON schema outputs with tools
+
+## 4. API Workflows
+
+### 4.1 RAG: Create workspace and upload files
+
+```bash
 POST /workspaces
-Body: { "display_name": "secure-vc-deals" }
-```
+Body: { "name": "secure-vc-deals" }
 
-Response provides `workspace_id` and its Gemini `file_search_store_name`.
-
-### 3.2 Upload files
-
-```
 POST /workspaces/{workspace_id}/files
-Body (form-data): files=<file>, files=<file2>, ...
+Body (form-data): files=<file1>, files=<file2>
 ```
 
-For each file the backend will:
+Files are encrypted, metadata extracted (company, doc_type, time_scope), and uploaded to Gemini File Search.
 
-1. Infer mime/doc types based on filename.
-2. Encrypt bytes with AES-256-GCM and persist metadata only.
-3. Upload plaintext once to Gemini File Search with chunking
-   (`350` token chunks / `40` token overlap) and metadata tags
-   (`workspace_id`, `doc_id`, `doc_type`).
-4. Wait until indexing completes before returning.
+### 4.2 RAG: Ask questions
 
-Response lists imported documents (`doc_id`, `filename`, `doc_type`).
-
-### 3.3 Ask questions
-
-```
+```bash
 POST /workspaces/{workspace_id}/ask
-Body:
-{
+Body: {
   "question": "Summarize key commercial terms in all contracts",
-  "metadata_filter": "doc_type=contract",
-  "history": [
-    {"role": "user", "text": "previous question"},
-    {"role": "assistant", "text": "previous answer"}
-  ]
+  "filter": "doc_type=\"contract\""
 }
 ```
 
-Gemini responds with a grounded answer across the workspace's File Search store.
+Returns grounded answer with citations from uploaded documents.
 
-## 4. Security & Extensibility
+### 4.3 Gemini 3: Chat
 
-- Files are encrypted at rest; only AES-256-GCM ciphertext + nonce stored in DB.
-- No plaintext hits disk or logs (temporary files are ephemeral for Gemini uploads).
-- Switching to a managed DB or adding auth only requires swapping the SQLAlchemy URL
-  and adding middleware—API design already separates workspaces per tenant.
-- Metadata filters (`doc_type=contract`, `doc_type=pitch_deck`, etc.) allow
-  targeted retrieval without re-uploading documents.
+```bash
+POST /api/v1/chat/gemini3
+Body: {
+  "messages": [{"role": "user", "parts": [{"text": "Hello"}]}],
+  "conversation_id": "optional-id-for-persistence",
+  "thinking_level": "high"
+}
+```
 
-## 5. Project Structure
+Supports text, images, PDFs, video with automatic media resolution handling.
+
+### 4.4 Gemini 3: Structured outputs
+
+```bash
+POST /api/v1/chat/gemini3/structured
+Body: {
+  "prompt": "Extract key metrics",
+  "jsonSchema": {"type": "object", "properties": {...}},
+  "tools": {"google_search": true, "url_context": false}
+}
+```
+
+## 5. Security & Extensibility
+
+- **Encryption**: Files encrypted at rest (AES-256-GCM); only ciphertext + nonce in DB
+- **No plaintext storage**: Temporary files are ephemeral for Gemini uploads only
+- **Database flexibility**: SQLite by default; swap `DATABASE_URL` for Postgres without code changes
+- **Workspace isolation**: Each workspace has its own File Search store and encrypted document blobs
+- **Metadata filtering**: Query by `company`, `doc_type`, `time_scope`, `sensitivity` without re-uploading
+
+## 6. Project Structure
 
 ```
-main.py                # FastAPI entrypoint
+main.py                    # FastAPI entrypoint with CORS
 app/
-  __init__.py
-  config.py            # Settings (env vars, AES key validation)
-  crypto.py            # AES-256-GCM helpers
-  db.py                # Async engine/session helpers
-  gemini_client.py     # Gemini SDK wrappers
-  models.py            # SQLAlchemy ORM models
-  schemas.py           # Pydantic request/response models
+  __init__.py              # Exports FastAPI app
+  main.py                  # App factory, startup, health endpoint
+  config.py                # Centralized config (Pydantic BaseSettings)
+  db.py                    # Async SQLAlchemy engine + session factory
+  models.py                # ORM models (Workspace, Document, ConversationHistory)
+  schemas.py               # Pydantic request/response models
+  gemini_client.py         # Gemini 2.5 Pro client (RAG/File Search)
   routers/
-    workspaces.py      # Workspace creation + uploads
-    chat.py            # RAG / ask endpoint
+    workspaces.py          # RAG endpoints (create, upload, ask, diagnostics)
+    gemini3.py             # Gemini 3 Pro endpoints (chat, structured)
+  services/
+    gemini3_client.py      # Gemini 3 Pro client wrapper
+    retrieval.py           # RAG router with filter planning
+    ingestion_agent.py     # File upload, encryption, File Search upload
+    encryption.py          # AES-256-GCM helpers
+  ingestion/
+    heuristics.py          # Metadata extraction from filenames/paths
+  prompts/
+    system_prompt.py       # Classification prompts
+    system_answer_style.py # RAG answer formatting
+    retrieval_planner.py   # Filter planning prompt
 ```
 
-This layout keeps Gemini logic, crypto, DB access, and routers isolated so you can
-easily extend the system (e.g., add auth, swap encryption keys per tenant, or move
-to a message history store).
+**Key Design Decisions**:
+- Two separate Gemini clients: RAG (2.5) vs Chat (3 Pro) - different APIs, different use cases
+- Centralized config via `app/config.py` - no `os.getenv()` scattered across codebase
+- Thin routers - business logic in services, routers handle HTTP layer only
+- Consistent error handling - custom exceptions (GeminiRAGError, Gemini3Error) converted to HTTP responses

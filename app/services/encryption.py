@@ -8,6 +8,8 @@ from typing import Dict
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from ..config import get_config
+
 
 class EncryptionConfigError(RuntimeError):
     """Raised when the FILE_ENC_KEY_B64 env var is missing or invalid."""
@@ -15,7 +17,9 @@ class EncryptionConfigError(RuntimeError):
 
 @lru_cache(maxsize=1)
 def _load_key() -> bytes:
-    key_b64 = os.getenv("FILE_ENC_KEY_B64")
+    """Load and validate encryption key from config."""
+    config = get_config()
+    key_b64 = config.FILE_ENC_KEY_B64
     if not key_b64:
         raise EncryptionConfigError("FILE_ENC_KEY_B64 env var is required for AES-256-GCM.")
 

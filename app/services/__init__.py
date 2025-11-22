@@ -3,7 +3,7 @@
 __all__ = [
     "encryption",
     "ingestion_agent",
-    "router_agent",
     "retrieval",
+    "gemini3_client",
 ]
 

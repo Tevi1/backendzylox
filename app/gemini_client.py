@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
@@ -10,24 +9,48 @@ from typing import Dict, List, Optional, Tuple
 from google import genai
 from google.genai import types
 
+from .config import get_config
 from .prompts.system_prompt import build_system_instruction
 from .prompts.system_answer_style import SYSTEM_ANSWER_STYLE
 from .prompts.retrieval_planner import FILTER_PLANNER_PROMPT
 
-CLASSIFICATION_MODEL = "gemini-2.0-flash-thinking-exp-01-21"
-RAG_MODEL = "gemini-2.5-pro"
+# Get model names from config (allows override via environment variables)
+_config = get_config()
+CLASSIFICATION_MODEL = _config.CLASSIFICATION_MODEL
+RAG_MODEL = _config.RAG_MODEL
+
+
+class GeminiRAGError(RuntimeError):
+    """Raised when Gemini RAG operations fail."""
 
 
 @lru_cache(maxsize=1)
 def _client() -> genai.Client:
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    """Get cached Gemini client instance."""
+    config = get_config()
+    api_key = config.get_gemini_api_key()
     if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY environment variable is required.")
+        raise GeminiRAGError("GEMINI_API_KEY environment variable is required.")
     return genai.Client(api_key=api_key)
 
 
 def create_file_search_store(display_name: str) -> types.FileSearchStore:
-    return _client().file_search_stores.create(config={"display_name": display_name})
+    """
+    Create a new Gemini File Search store.
+
+    Args:
+        display_name: Human-readable name for the store.
+
+    Returns:
+        FileSearchStore instance with store name.
+
+    Raises:
+        GeminiRAGError: If store creation fails.
+    """
+    try:
+        return _client().file_search_stores.create(config={"display_name": display_name})
+    except Exception as exc:
+        raise GeminiRAGError(f"Failed to create File Search store: {exc}") from exc
 
 
 def upload_file_to_store(store_name: str, tmp_path: str, cfg: Dict[str, object]) -> Dict[str, object]:
@@ -81,7 +104,21 @@ def plan_filters(
     model: str = RAG_MODEL,
     prompt: str = FILTER_PLANNER_PROMPT,
 ) -> dict:
-    """Run the planner pass (no tools) to get JSON filter suggestions."""
+    """
+    Run the planner pass (no tools) to get JSON filter suggestions.
+
+    Args:
+        question: User question to analyze.
+        distinct_values: Dict with keys 'company', 'doc_type', 'time_scope' and lists of available values.
+        model: Gemini model name (default: gemini-2.5-pro).
+        prompt: System prompt for filter planning.
+
+    Returns:
+        Dict with suggested filters: company, doc_types, time_scope, temperature, etc.
+
+    Raises:
+        GeminiRAGError: If API call fails or response cannot be parsed.
+    """
 
     cfg = types.GenerateContentConfig(
         system_instruction=prompt,
@@ -97,22 +134,17 @@ def plan_filters(
         "known_doc_types": distinct_values.get("doc_type", []),
         "known_time_scopes": distinct_values.get("time_scope", []),
     }
-    response = _client().models.generate_content(
-        model=model,
-        contents=json.dumps(seeds),
-        config=cfg,
-    )
     try:
+        response = _client().models.generate_content(
+            model=model,
+            contents=json.dumps(seeds),
+            config=cfg,
+        )
         return json.loads(response.text)
-    except Exception:
-        return {
-            "company": None,
-            "doc_types": None,
-            "time_scope": None,
-            "strict_quote": False,
-            "answer_shape": "sections",
-            "temperature": 0.2,
-        }
+    except json.JSONDecodeError as exc:
+        raise GeminiRAGError(f"Failed to parse filter plan JSON: {exc}") from exc
+    except Exception as exc:
+        raise GeminiRAGError(f"Filter planning API call failed: {exc}") from exc
 
 
 def ask_with_file_search(
@@ -124,7 +156,23 @@ def ask_with_file_search(
     model: str = RAG_MODEL,
     temperature: float = 0.2,
 ) -> Tuple[str, Optional[dict]]:
-    """Call Gemini with File Search tool and return answer + grounding metadata."""
+    """
+    Call Gemini with File Search tool and return answer + grounding metadata.
+
+    Args:
+        store_name: Gemini File Search store name to query.
+        question: User question to answer.
+        metadata_filter: Optional metadata filter string (e.g., 'company="Acme" AND doc_type="contract"').
+        system_instruction: System prompt for answer formatting.
+        model: Gemini model name (default: gemini-2.5-pro).
+        temperature: Generation temperature (default: 0.2).
+
+    Returns:
+        Tuple of (answer_text, grounding_metadata_dict).
+
+    Raises:
+        GeminiRAGError: If API call fails or response is invalid.
+    """
 
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
@@ -143,11 +191,14 @@ def ask_with_file_search(
         response_mime_type="text/plain",
     )
 
-    response = _client().models.generate_content(
-        model=model,
-        contents=[types.Content(role="user", parts=[types.Part(text=question)])],
-        config=config,
-    )
+    try:
+        response = _client().models.generate_content(
+            model=model,
+            contents=[types.Content(role="user", parts=[types.Part(text=question)])],
+            config=config,
+        )
+    except Exception as exc:
+        raise GeminiRAGError(f"Gemini File Search API call failed: {exc}") from exc
 
     candidate = response.candidates[0] if getattr(response, "candidates", None) else None
     grounding_dict = _grounding_dict(candidate)

@@ -1,1 +1,0 @@
-Sample doc for testing Gemini file search.

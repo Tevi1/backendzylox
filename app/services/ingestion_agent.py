@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -13,10 +14,12 @@ from typing import Dict, List, Sequence, Tuple
 from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..gemini_client import classify_document, upload_file_to_store
+from ..gemini_client import GeminiRAGError, classify_document, upload_file_to_store
 from ..ingestion.heuristics import chunk_preset_for_doc_type, derive_metadata
 from ..models import Document, Workspace
 from .encryption import encrypt_bytes
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _detect_companies(files: Sequence[UploadFile]) -> List[str]:
@@ -85,11 +88,32 @@ async def process_uploaded_folder(
     files: Sequence[UploadFile],
     session: AsyncSession,
 ) -> Tuple[List[Dict[str, object]], List[str]]:
-    """Process multi-file folder uploads (webkitdirectory)."""
+    """
+    Process multi-file folder uploads (webkitdirectory).
 
+    For each file:
+    1. Extract metadata via heuristics (filename/path patterns)
+    2. Classify via Gemini (company, doc_type, sensitivity)
+    3. Encrypt file bytes (AES-256-GCM)
+    4. Upload to Gemini File Search with metadata tags
+    5. Persist encrypted blob + metadata to database
+
+    Args:
+        workspace: Target workspace for uploads.
+        files: Sequence of uploaded files.
+        session: Database session.
+
+    Returns:
+        Tuple of (imported_documents_list, discovered_companies_list).
+
+    Raises:
+        GeminiRAGError: If classification or File Search upload fails.
+    """
     if not files:
+        LOGGER.warning("Empty file list provided for workspace %s", workspace.id)
         return [], []
 
+    LOGGER.info("Processing %d files for workspace %s", len(files), workspace.id)
     company_candidates = _detect_companies(files)
     imported: List[Dict[str, object]] = []
     discovered: set[str] = set()
@@ -110,13 +134,20 @@ async def process_uploaded_folder(
 
         heuristics_meta = derive_metadata(folder_path, file_path.name, company_guess)
         text_preview = _text_preview(raw_bytes)
-        classification_payload = await asyncio.to_thread(
-            classify_document,
-            company_candidates,
-            str(file_path),
-            text_preview,
-        )
-        classification_meta = _safe_parse_classification(classification_payload, company_guess)
+        try:
+            classification_payload = await asyncio.to_thread(
+                classify_document,
+                company_candidates,
+                str(file_path),
+                text_preview,
+            )
+            classification_meta = _safe_parse_classification(classification_payload, company_guess)
+        except GeminiRAGError as exc:
+            LOGGER.warning("Classification failed for %s: %s, using heuristics only", file_path.name, exc)
+            classification_meta = _default_metadata(company_guess)
+        except Exception as exc:
+            LOGGER.warning("Unexpected classification error for %s: %s, using heuristics only", file_path.name, exc)
+            classification_meta = _default_metadata(company_guess)
 
         combined_meta = {
             "company": classification_meta.get("company") or heuristics_meta.get("company"),
@@ -189,11 +220,19 @@ async def process_uploaded_folder(
                     }
                 },
             }
+            LOGGER.debug("Uploading %s to File Search store %s", file_path.name, workspace.file_search_store_name)
             response = await _upload_to_file_search(
                 workspace.file_search_store_name,
                 tmp_path,
                 upload_config,
             )
+            LOGGER.info("Successfully indexed %s (doc_id=%s)", file_path.name, doc_id)
+        except GeminiRAGError as exc:
+            LOGGER.error("File Search upload failed for %s: %s", file_path.name, exc)
+            raise
+        except Exception as exc:
+            LOGGER.exception("Unexpected error uploading %s to File Search", file_path.name)
+            raise GeminiRAGError(f"File Search upload failed: {exc}") from exc
         finally:
             try:
                 os.unlink(tmp_path)
@@ -213,5 +252,6 @@ async def process_uploaded_folder(
         if document.company:
             discovered.add(document.company)
 
+    LOGGER.info("Ingestion complete: %d files imported, %d companies discovered", len(imported), len(discovered))
     return imported, sorted(discovered)
 

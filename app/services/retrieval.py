@@ -3,12 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import re
-import os
 from typing import Dict, List, Optional
 
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import get_config
 from ..gemini_client import RAG_MODEL, ask_with_file_search, plan_filters
 from ..models import Document, Workspace
 from ..prompts.system_answer_style import SYSTEM_ANSWER_STYLE
@@ -17,7 +17,52 @@ from ..prompts.retrieval_planner import FILTER_PLANNER_PROMPT
 ALLOWED_FIELDS = {"company", "doc_type", "time_scope", "sensitivity"}
 FILE_EXT_HINTS = (".pdf", ".docx", ".pptx", ".txt", ".md", ".rtf", ".json", ".csv", ".xlsx")
 CONTRACT_Q = re.compile(r"\b(obligation|clause|liabilit|indemn|sla|termination)\b", re.IGNORECASE)
-DEV_MODE = os.getenv("APP_ENV") == "dev"
+
+# Complex question triggers for enhanced retrieval
+COMPLEX_TRIGGERS = [
+    "MSA", "clause", "promise", "obligation", "risk", "architecture",
+    "security", "roadmap", "pricing", "market", "contradiction",
+    "versus", "vs", "compare", "reality", "fall short", "gap"
+]
+
+# Doc-type boosting rules for question patterns
+DOC_TYPE_BOOSTS = {
+    "legal_promise": {
+        "triggers": ["MSA", "clause", "contract", "promise", "liability", "obligation", "breach", "reality"],
+        "boost_doc_types": ["contract", "security", "roadmap", "memo"],
+        "top_k": 12,
+    },
+    "pricing": {
+        "triggers": ["pricing", "ACV", "£60k", "tier", "plan", "cost", "margin"],
+        "boost_doc_types": ["deck", "memo"],
+        "top_k": 10,
+    },
+    "risk_register": {
+        "triggers": ["risk register", "risk", "risks", "mitigation"],
+        "boost_doc_types": ["contract", "security", "roadmap", "memo", "deck"],  # All doc types
+        "top_k": 12,
+        "strategy": "multi_doc",  # Force retrieval from all available doc_types
+    },
+    "comparison": {
+        "triggers": ["compare", "versus", "vs", "promises vs reality", "what we say vs what we do"],
+        "boost_doc_types": ["contract", "security", "roadmap", "memo"],
+        "top_k": 12,
+        "strategy": "multi_doc",  # Force multi-doc retrieval
+    },
+    "infrastructure": {
+        "triggers": ["architecture", "infra", "implementation", "KMS", "VPC", "security"],
+        "boost_doc_types": ["security", "roadmap"],
+        "top_k": 10,
+    },
+    "business": {
+        "triggers": ["market", "positioning", "GTM", "strategy"],
+        "boost_doc_types": ["deck", "memo", "roadmap"],
+        "top_k": 10,
+    },
+}
+
+_config = get_config()
+DEV_MODE = _config.is_dev
 
 
 def _is_real_value(value: Optional[str]) -> bool:
@@ -47,6 +92,74 @@ def _detect_company_in_question(question: str, companies: List[str]) -> Optional
 
 def _has_contract_intent(question: str) -> bool:
     return bool(CONTRACT_Q.search(question or ""))
+
+
+def is_comparison_question(question: str) -> bool:
+    """
+    Detect if question requires cross-document comparison.
+    
+    Examples: "compare promises vs reality", "list contradictions", "build risk register"
+    """
+    question_lower = (question or "").lower()
+    comparison_patterns = [
+        r"\bcompare\b",
+        r"\bversus\b",
+        r"\bvs\b",
+        r"\bpromise.*reality\b",
+        r"\breality.*promise\b",
+        r"\bcontradiction\b",
+        r"\brisk\s+register\b",
+        r"\bwhere.*fall\s+short\b",
+        r"\bgap\b",
+        r"\balignment\b",
+    ]
+    return any(re.search(pattern, question_lower, re.IGNORECASE) for pattern in comparison_patterns)
+
+
+def get_boosted_doc_types(question: str) -> List[str]:
+    """
+    Return doc_types to boost based on question content.
+    
+    Returns list of doc_types that should be prioritized for this question.
+    """
+    question_lower = (question or "").lower()
+    boosted = set()
+    
+    for boost_rule in DOC_TYPE_BOOSTS.values():
+        triggers = boost_rule["triggers"]
+        if any(trigger.lower() in question_lower for trigger in triggers):
+            boosted.update(boost_rule["boost_doc_types"])
+    
+    return list(boosted) if boosted else []
+
+
+def get_retrieval_strategy(question: str) -> Dict[str, any]:
+    """
+    Return retrieval strategy (doc_types, top_k, strategy) based on question content.
+    
+    Returns dict with:
+    - boost_doc_types: List of doc_types to prioritize
+    - top_k: Suggested number of chunks (if applicable)
+    - strategy: "multi_doc" if should fetch from all doc_types, None otherwise
+    """
+    question_lower = (question or "").lower()
+    
+    # Check each boost rule
+    for rule_name, boost_rule in DOC_TYPE_BOOSTS.items():
+        triggers = boost_rule["triggers"]
+        if any(trigger.lower() in question_lower for trigger in triggers):
+            return {
+                "boost_doc_types": boost_rule["boost_doc_types"],
+                "top_k": boost_rule.get("top_k", 8),
+                "strategy": boost_rule.get("strategy"),
+            }
+    
+    # Default
+    return {
+        "boost_doc_types": [],
+        "top_k": 8,
+        "strategy": None,
+    }
 
 
 def _has_context(grounding: Optional[dict]) -> bool:
@@ -155,28 +268,6 @@ def _sanitize_and_whitelist(
     return final_filter, warnings
 
 
-async def _ask_once(
-    store_name: str,
-    question: str,
-    metadata_filter: Optional[str],
-    intent: str,
-    system_instruction: str,
-) -> Dict[str, object]:
-    answer, grounding = await asyncio.to_thread(
-        generate_with_intent,
-        store_name,
-        question,
-        intent,
-        system_instruction,
-        metadata_filter,
-    )
-    return {
-        "answer": answer,
-        "grounding_metadata": grounding,
-        "metadata_filter": metadata_filter,
-    }
-
-
 def _build_suggestions(distinct: Dict[str, List[str]]) -> List[str]:
     suggestions: List[str] = []
     for key in ("doc_type", "company", "time_scope"):
@@ -185,6 +276,19 @@ def _build_suggestions(distinct: Dict[str, List[str]]) -> List[str]:
             if suggestion not in suggestions:
                 suggestions.append(suggestion)
     return suggestions
+
+
+def _build_filter(company: Optional[str], doc_types: Optional[List[str]], time_scope: Optional[str]) -> Optional[str]:
+    parts = []
+    if company:
+        parts.append(f'company="{company}"')
+    if doc_types:
+        ors = " OR ".join(f'doc_type="{d}"' for d in doc_types if d)
+        if ors:
+            parts.append(f"({ors})")
+    if time_scope:
+        parts.append(f'time_scope="{time_scope}"')
+    return " AND ".join(parts) if parts else None
 
 
 async def ask_router(
@@ -204,17 +308,6 @@ async def ask_router(
         RAG_MODEL,
         FILTER_PLANNER_PROMPT,
     )
-    def _build_filter(company, doc_types, time_scope) -> Optional[str]:
-        parts = []
-        if company:
-            parts.append(f'company="{company}"')
-        if doc_types:
-            ors = " OR ".join(f'doc_type="{d}"' for d in doc_types if d)
-            if ors:
-                parts.append(f"({ors})")
-        if time_scope:
-            parts.append(f'time_scope="{time_scope}"')
-        return " AND ".join(parts) if parts else None
 
     planner_filter = _build_filter(
         plan.get("company"),
@@ -225,10 +318,36 @@ async def ask_router(
     temperature = plan.get("temperature", 0.2) or 0.2
 
     contract_intent = _has_contract_intent(question)
+    is_comparison = is_comparison_question(question)
+    boosted_doc_types = get_boosted_doc_types(question)
 
     attempts: List[tuple[str, Optional[str]]] = []
+    
+    # For comparison questions, ensure we get multiple doc_types
+    if is_comparison and not safe_filter:
+        # Build filter that includes multiple doc_types
+        available_doc_types = diagnostics.get("doc_type", [])
+        relevant_types = [dt for dt in boosted_doc_types if dt in available_doc_types]
+        if not relevant_types:
+            # Fallback: try to get contract, security, roadmap if available
+            for preferred in ["contract", "security", "roadmap"]:
+                if preferred in available_doc_types:
+                    relevant_types.append(preferred)
+                    if len(relevant_types) >= 3:
+                        break
+        
+        if relevant_types:
+            comparison_filter = " OR ".join(f'doc_type="{dt}"' for dt in relevant_types[:3])
+            attempts.append(("comparison_multi_doc", comparison_filter))
     if not safe_filter and contract_intent:
         attempts.append(("intent_contract", 'doc_type="contract"'))
+    # Add boosted doc_types filter if available
+    if boosted_doc_types and not safe_filter:
+        available_doc_types = diagnostics.get("doc_type", [])
+        relevant_boosted = [dt for dt in boosted_doc_types if dt in available_doc_types]
+        if relevant_boosted:
+            boost_filter = " OR ".join(f'doc_type="{dt}"' for dt in relevant_boosted)
+            attempts.append(("boosted_doc_types", boost_filter))
     if safe_filter:
         attempts.append(("user_filter", safe_filter))
     if planner_filter:
@@ -244,7 +363,6 @@ async def ask_router(
 
     tried: set[str] = set()
     response: Dict[str, object] | None = None
-    relaxed_scope = None
 
     for scope, filt in attempts:
         key = f"{scope}:{filt}"
@@ -272,7 +390,7 @@ async def ask_router(
     else:
         response = None
 
-    if response is None or not _has_context(response["grounding_metadata"]):
+    if not response or not _has_context(response.get("grounding_metadata")):
         for comp, docs, tscope in relaxed_attempts:
             filt = _build_filter(comp, docs, tscope)
             key = f"relaxed:{filt}"
@@ -300,7 +418,7 @@ async def ask_router(
                     response["relaxed"] = True
                 break
 
-    if response is None or not _has_context(response["grounding_metadata"]):
+    if not response or not _has_context(response.get("grounding_metadata")):
         suggestions = _build_suggestions(diagnostics)
         response = {
             "answer": "Not enough evidence in the provided documents.",

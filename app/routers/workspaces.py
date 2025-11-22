@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from typing import List
 
@@ -11,10 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import schemas
 from ..db import get_session
-from ..gemini_client import create_file_search_store
+from ..gemini_client import GeminiRAGError, create_file_search_store
 from ..models import Document, Workspace
 from ..services.ingestion_agent import process_uploaded_folder
 from ..services.retrieval import ask_router
+
+LOGGER = logging.getLogger(__name__)
 
 
 FILE_EXT_HINTS = (".pdf", ".docx", ".pptx", ".txt", ".md", ".rtf")
@@ -64,21 +67,37 @@ async def create_workspace(
     body: schemas.WorkspaceCreate,
     session: AsyncSession = Depends(get_session),
 ):
-    workspace_id = secrets.token_hex(8)
-    store = await asyncio.to_thread(create_file_search_store, body.name)
+    """Create a new workspace with associated Gemini File Search store."""
+    try:
+        workspace_id = secrets.token_hex(8)
+        LOGGER.info("Creating workspace '%s' (id=%s)", body.name, workspace_id)
+        store = await asyncio.to_thread(create_file_search_store, body.name)
 
-    workspace = Workspace(
-        id=workspace_id,
-        name=body.name,
-        file_search_store_name=store.name,
-    )
-    session.add(workspace)
-    await session.commit()
+        workspace = Workspace(
+            id=workspace_id,
+            name=body.name,
+            file_search_store_name=store.name,
+        )
+        session.add(workspace)
+        await session.commit()
+        LOGGER.info("Workspace created successfully: %s", workspace_id)
 
-    return schemas.WorkspaceOut(
-        workspace_id=workspace_id,
-        file_search_store_name=store.name,
-    )
+        return schemas.WorkspaceOut(
+            workspace_id=workspace_id,
+            file_search_store_name=store.name,
+        )
+    except GeminiRAGError as exc:
+        LOGGER.error("Failed to create File Search store: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": "Failed to create workspace. Gemini API unavailable.", "code": "GEMINI_ERROR"},
+        ) from exc
+    except Exception as exc:
+        LOGGER.exception("Unexpected error creating workspace")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Internal server error", "code": "INTERNAL_ERROR"},
+        ) from exc
 
 
 @router.post(
@@ -90,11 +109,24 @@ async def upload_folder(
     files: List[UploadFile] = File(...),
     session: AsyncSession = Depends(get_session),
 ):
+    """Upload multiple files to a workspace (alias for /files endpoint)."""
     workspace = await session.get(Workspace, workspace_id)
     if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        LOGGER.warning("Workspace not found: %s", workspace_id)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": "Workspace not found", "code": "WORKSPACE_NOT_FOUND"},
+        )
 
-    return await _ingest_files_response(workspace, files, session)
+    LOGGER.info("Uploading %d files to workspace %s", len(files), workspace_id)
+    try:
+        return await _ingest_files_response(workspace, files, session)
+    except Exception as exc:
+        LOGGER.exception("File ingestion failed for workspace %s", workspace_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": f"File ingestion failed: {exc}", "code": "INGESTION_ERROR"},
+        ) from exc
 
 
 @router.post(
@@ -119,12 +151,20 @@ async def ask_workspace(
     payload: schemas.AskRequest,
     session: AsyncSession = Depends(get_session),
 ):
+    """Ask a question using RAG over workspace documents."""
     workspace = await session.get(Workspace, workspace_id)
     if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        LOGGER.warning("Workspace not found: %s", workspace_id)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": "Workspace not found", "code": "WORKSPACE_NOT_FOUND"},
+        )
 
     if not payload.question:
-        raise HTTPException(status_code=400, detail="Missing question")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Missing question", "code": "MISSING_QUESTION"},
+        )
 
     metadata_filter = payload.metadata_filter
     if metadata_filter is not None:
@@ -132,12 +172,24 @@ async def ask_workspace(
         if not metadata_filter:
             metadata_filter = None
 
+    LOGGER.info("RAG query for workspace %s: %s", workspace_id, payload.question[:100])
     system_vars: dict = {}
 
     try:
         result = await ask_router(session, workspace, payload.question, metadata_filter, system_vars=system_vars)
-    except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=500, detail=str(exc))
+        LOGGER.info("RAG query completed for workspace %s (scope=%s)", workspace_id, result.get("scope"))
+    except GeminiRAGError as exc:
+        LOGGER.error("Gemini RAG error for workspace %s: %s", workspace_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"message": "RAG service unavailable", "code": "GEMINI_RAG_ERROR"},
+        ) from exc
+    except Exception as exc:
+        LOGGER.exception("Unexpected error in RAG query for workspace %s", workspace_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": f"Internal error: {exc}", "code": "INTERNAL_ERROR"},
+        ) from exc
 
     return schemas.AskResponse(**result)
 

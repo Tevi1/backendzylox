@@ -1,0 +1,345 @@
+{
+  "backend_structure": {
+    "description": "Complete documentation of all backend files, their purposes, and necessity",
+    "last_updated": "2024",
+    "files": [
+      {
+        "path": "main.py",
+        "type": "entrypoint",
+        "purpose": "FastAPI application entry point with CORS middleware configuration. Runs uvicorn server on port 8000 with auto-reload enabled.",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["app.main", "uvicorn"],
+        "notes": "Root-level entry point. Loads .env via app/main.py's load_dotenv()"
+      },
+      {
+        "path": "app/__init__.py",
+        "type": "module_init",
+        "purpose": "Exports the FastAPI app instance from app.main for use by main.py",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["app.main"],
+        "notes": "Standard Python package init file"
+      },
+      {
+        "path": "app/main.py",
+        "type": "application_factory",
+        "purpose": "FastAPI app factory. Initializes database on startup, includes routers (workspaces, gemini3), defines /health endpoint. Loads .env file via load_dotenv().",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["app.db", "app.routers"],
+        "notes": "Core application setup. Registers all API routes"
+      },
+      {
+        "path": "app/db.py",
+        "type": "database",
+        "purpose": "SQLAlchemy async database configuration. Creates async engine, session factory, and provides get_session() dependency. Initializes tables via init_db().",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["sqlalchemy", "aiosqlite"],
+        "notes": "Database connection management. Uses SQLite by default, can swap to Postgres"
+      },
+      {
+        "path": "app/models.py",
+        "type": "orm_models",
+        "purpose": "SQLAlchemy ORM models: Workspace (id, name, file_search_store_name), Document (metadata, encrypted blobs), ConversationHistory (for Gemini 3 chat persistence with thought signatures).",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["sqlalchemy"],
+        "notes": "Database schema definitions. Base.metadata.create_all() creates tables"
+      },
+      {
+        "path": "app/schemas.py",
+        "type": "pydantic_models",
+        "purpose": "Pydantic request/response schemas for FastAPI validation. Includes WorkspaceCreate/Out, AskRequest/Response, Gemini3ChatRequest/Response, Gemini3StructuredRequest/Response, DiagnosticsResponse, etc.",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["pydantic"],
+        "notes": "API contract definitions. Validates all incoming requests and formats responses"
+      },
+      {
+        "path": "app/gemini_client.py",
+        "type": "gemini_sdk_wrapper",
+        "purpose": "Legacy Gemini 2.5 Pro client for File Search RAG. Functions: create_file_search_store(), classify_document(), plan_filters(), ask_with_file_search(). Uses RAG_MODEL='gemini-2.5-pro'.",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["google.genai"],
+        "notes": "Used by /workspaces/{id}/ask endpoint for document-based Q&A. Separate from Gemini 3 client"
+      },
+      {
+        "path": "app/services/gemini3_client.py",
+        "type": "gemini3_client",
+        "purpose": "Gemini 3 Pro preview client wrapper. Separate v1beta (text) and v1alpha (media) clients. Methods: generate_text(), generate_multimodal(), generate_structured(). Handles thinking_level, media_resolution, tools (Google Search, URL Context, Code Execution).",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["google.genai"],
+        "notes": "New Gemini 3 Pro support. Used by /api/v1/chat/gemini3 endpoints"
+      },
+      {
+        "path": "app/services/retrieval.py",
+        "type": "rag_router",
+        "purpose": "Adaptive ask router for File Search RAG. Main function: ask_router() - tries multiple filter strategies (user filter, planner filter, contract intent, relaxed attempts). Sanitizes metadata filters, builds filter strings, calls ask_with_file_search() with retry logic.",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["app.gemini_client", "app.models"],
+        "notes": "Core RAG logic. Used by /workspaces/{id}/ask endpoint"
+      },
+      {
+        "path": "app/services/ingestion_agent.py",
+        "type": "file_processor",
+        "purpose": "File upload and ingestion pipeline. process_uploaded_folder() encrypts files (AES-256-GCM), uploads to Gemini File Search, extracts metadata via heuristics + classification, persists to database. Handles chunking, indexing wait, metadata tagging.",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["app.services.encryption", "app.ingestion.heuristics", "app.gemini_client"],
+        "notes": "Used by /workspaces/{id}/files and /workspaces/{id}/folder-upload endpoints"
+      },
+      {
+        "path": "app/services/encryption.py",
+        "type": "crypto_service",
+        "purpose": "AES-256-GCM encryption/decryption for file blobs. Encrypts before storing in database, decrypts when needed. Uses FILE_ENC_KEY_B64 from environment.",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["cryptography"],
+        "notes": "Security layer. Files stored encrypted at rest"
+      },
+      {
+        "path": "app/services/router_agent.py",
+        "type": "query_router",
+        "purpose": "Simple keyword-based router for company scoping. route_query() matches company names in questions. Returns company filter or None. Very lightweight.",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Appears unused. Retrieval.py has its own company detection logic. Can be removed if not referenced elsewhere"
+      },
+      {
+        "path": "app/services/intent.py",
+        "type": "intent_detection",
+        "purpose": "Lightweight intent detection helpers. detect_intent() identifies clause/contract queries, comparison queries, table/metric queries. Uses regex patterns.",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Appears unused. Retrieval.py has _has_contract_intent() with similar logic. Can be removed if not referenced"
+      },
+      {
+        "path": "app/services/__init__.py",
+        "type": "module_init",
+        "purpose": "Exports service modules for easy imports",
+        "needed": true,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Package organization"
+      },
+      {
+        "path": "app/routers/workspaces.py",
+        "type": "api_router",
+        "purpose": "Workspace management and RAG endpoints: POST /workspaces (create), POST /workspaces/{id}/files (upload), POST /workspaces/{id}/ask (RAG query), GET /workspaces/{id}/diagnostics (metadata counts).",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["app.services.ingestion_agent", "app.services.retrieval", "app.gemini_client"],
+        "notes": "Main RAG API endpoints. Uses Gemini 2.5 Pro File Search"
+      },
+      {
+        "path": "app/routers/gemini3.py",
+        "type": "api_router",
+        "purpose": "Gemini 3 Pro preview endpoints: POST /api/v1/chat/gemini3 (text + multimodal chat with thought signatures), POST /api/v1/chat/gemini3/structured (JSON schema outputs with tools). Handles conversation persistence, retry logic, media resolution.",
+        "needed": true,
+        "critical": true,
+        "dependencies": ["app.services.gemini3_client", "app.models"],
+        "notes": "New Gemini 3 Pro API. Separate from legacy RAG system"
+      },
+      {
+        "path": "app/routers/__init__.py",
+        "type": "module_init",
+        "purpose": "Exports router modules (workspaces, gemini3) for app.main to include",
+        "needed": true,
+        "critical": true,
+        "dependencies": [],
+        "notes": "Required for app.main imports"
+      },
+      {
+        "path": "app/routers/files_ingest_note.txt",
+        "type": "documentation",
+        "purpose": "Notes about ingestion requirements: ensure heuristics metadata is merged, contract filenames tagged as doc_type='contract'.",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Documentation file. Can be moved to docs/ or removed if requirements are met"
+      },
+      {
+        "path": "app/prompts/system_prompt.py",
+        "type": "prompt_template",
+        "purpose": "System prompt builder for document classification. build_system_instruction() creates prompts for company/doc_type classification.",
+        "needed": true,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Used by classify_document() in gemini_client.py"
+      },
+      {
+        "path": "app/prompts/system_answer_style.py",
+        "type": "prompt_template",
+        "purpose": "SYSTEM_ANSWER_STYLE constant - defines how Gemini should format RAG answers (grounded, cited, structured).",
+        "needed": true,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Used by ask_with_file_search() in gemini_client.py"
+      },
+      {
+        "path": "app/prompts/retrieval_planner.py",
+        "type": "prompt_template",
+        "purpose": "FILTER_PLANNER_PROMPT - JSON prompt for plan_filters() to suggest metadata filters based on question and available values.",
+        "needed": true,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Used by plan_filters() in gemini_client.py, called by retrieval.py"
+      },
+      {
+        "path": "app/prompts/__init__.py",
+        "type": "module_init",
+        "purpose": "Package init for prompts module",
+        "needed": true,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Standard package structure"
+      },
+      {
+        "path": "app/ingestion/heuristics.py",
+        "type": "metadata_extraction",
+        "purpose": "Filename/path heuristics for metadata inference. guess_doc_type_from_filename() (contract/deck/security/memo), chunk_preset_for_doc_type() (chunk sizes), derive_metadata() (company, doc_type, time_scope, sensitivity).",
+        "needed": true,
+        "critical": true,
+        "dependencies": [],
+        "notes": "Used by ingestion_agent.py to infer metadata before classification"
+      },
+      {
+        "path": "app/ingestion/__init__.py",
+        "type": "module_init",
+        "purpose": "Package init for ingestion module",
+        "needed": true,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Standard package structure"
+      },
+      {
+        "path": "requirements.txt",
+        "type": "dependencies",
+        "purpose": "Python package dependencies: FastAPI, uvicorn, pydantic, google-genai, sqlalchemy, cryptography, pytest, etc.",
+        "needed": true,
+        "critical": true,
+        "dependencies": [],
+        "notes": "pip install -r requirements.txt installs all dependencies"
+      },
+      {
+        "path": "README.md",
+        "type": "documentation",
+        "purpose": "Project documentation: setup instructions, API workflows, environment variables, security notes.",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Helpful for onboarding but not required for runtime"
+      },
+      {
+        "path": "data.db",
+        "type": "database_file",
+        "purpose": "SQLite database file. Contains workspaces, documents, conversation_histories tables. Created automatically on first startup.",
+        "needed": true,
+        "critical": true,
+        "dependencies": [],
+        "notes": "Persistent storage. Can be swapped for Postgres via DATABASE_URL"
+      },
+      {
+        "path": "tests/conftest.py",
+        "type": "test_config",
+        "purpose": "Pytest configuration and fixtures. Sets up test database, FastAPI test client, async session fixtures.",
+        "needed": true,
+        "critical": false,
+        "dependencies": ["pytest", "pytest-asyncio"],
+        "notes": "Required for running tests"
+      },
+      {
+        "path": "tests/test_gemini3.py",
+        "type": "test_suite",
+        "purpose": "Unit tests for Gemini 3 endpoints: text generation, media resolution, structured outputs, thought signatures, conversation persistence.",
+        "needed": true,
+        "critical": false,
+        "dependencies": ["pytest", "pytest-asyncio"],
+        "notes": "Test coverage for new Gemini 3 features"
+      },
+      {
+        "path": "docs/api_examples/ask.json",
+        "type": "example",
+        "purpose": "Example API request/response for /workspaces/{id}/ask endpoint",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Documentation/example file"
+      },
+      {
+        "path": "docs/api_examples/ask_alias.json",
+        "type": "example",
+        "purpose": "Example API request using filter alias instead of metadata_filter",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Documentation/example file"
+      },
+      {
+        "path": "sample.rtf",
+        "type": "test_data",
+        "purpose": "Sample RTF file for testing ingestion",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Can be removed - test data"
+      },
+      {
+        "path": "sample.txt",
+        "type": "test_data",
+        "purpose": "Sample text file for testing ingestion",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Can be removed - test data"
+      },
+      {
+        "path": "sample.zip",
+        "type": "test_data",
+        "purpose": "Sample zip file for testing ingestion",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Can be removed - test data"
+      },
+      {
+        "path": "empty.txt",
+        "type": "test_data",
+        "purpose": "Empty test file",
+        "needed": false,
+        "critical": false,
+        "dependencies": [],
+        "notes": "Can be removed - test data"
+      }
+    ],
+    "summary": {
+      "total_files": 32,
+      "critical_files": 18,
+      "optional_files": 14,
+      "can_remove": [
+        "app/services/router_agent.py",
+        "app/services/intent.py",
+        "app/routers/files_ingest_note.txt",
+        "sample.rtf",
+        "sample.txt",
+        "sample.zip",
+        "empty.txt"
+      ],
+      "architecture_notes": {
+        "two_gemini_clients": "app/gemini_client.py (Gemini 2.5 Pro for RAG) and app/services/gemini3_client.py (Gemini 3 Pro for chat) are separate systems",
+        "rag_flow": "workspaces.py -> retrieval.py -> gemini_client.py -> Gemini File Search API",
+        "gemini3_flow": "gemini3.py -> gemini3_client.py -> Gemini 3 Pro API",
+        "encryption": "All file blobs encrypted before database storage via services/encryption.py",
+        "metadata": "Heuristics (ingestion/heuristics.py) + classification (gemini_client.py) extract metadata for filtering"
+      }
+    }
+  }
+}
+
